@@ -5,10 +5,12 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-os.environ["DATABASE_URL"] = (
-    "postgresql://leaderboard:leaderboard@postgres:5432/leaderboard"
+# Use Docker Compose defaults locally, but preserve URLs provided by CircleCI.
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql://leaderboard:leaderboard@postgres:5432/leaderboard",
 )
-os.environ["REDIS_URL"] = "redis://redis:6379/0"
+os.environ.setdefault("REDIS_URL", "redis://redis:6379/0")
 
 from app.main import app  # noqa: E402
 
