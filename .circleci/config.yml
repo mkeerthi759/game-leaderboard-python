@@ -1,0 +1,159 @@
+
+version: 2.1
+
+jobs:
+  lint:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies and Ruff
+          command: pip install -r requirements.txt ruff
+      - run:
+          name: Run Ruff
+          command: ruff check app tests
+
+  unit-tests:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Install test dependencies
+          command: pip install -r requirements.txt pytest pytest-cov
+      - run:
+          name: Run unit tests with coverage
+          command: |
+            PYTHONPATH=. pytest -q \
+              --cov=app.scoring \
+              --cov-report=term-missing \
+              --cov-fail-under=70 \
+              tests/test_scoring.py
+
+  integration-tests:
+    docker:
+      - image: cimg/python:3.12
+      - image: cimg/postgres:16.4
+        environment:
+          POSTGRES_DB: leaderboard
+          POSTGRES_USER: leaderboard
+          POSTGRES_PASSWORD: leaderboard
+      - image: cimg/redis:7.2
+    environment:
+      DATABASE_URL: postgresql://leaderboard:leaderboard@127.0.0.1:5432/leaderboard
+      REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: pip install -r requirements.txt pytest httpx
+      - run:
+          name: Wait for PostgreSQL and Redis
+          command: |
+            python - <<'PY'
+            import socket
+            import time
+
+            services = [
+                ("127.0.0.1", 5432, "PostgreSQL"),
+                ("127.0.0.1", 6379, "Redis"),
+            ]
+
+            for host, port, name in services:
+                for attempt in range(60):
+                    try:
+                        with socket.create_connection((host, port), timeout=2):
+                            print(f"{name} is accepting connections")
+                            break
+                    except OSError:
+                        if attempt == 59:
+                            raise RuntimeError(f"{name} did not become ready")
+                        time.sleep(2)
+            PY
+      - run:
+          name: Apply database migrations
+          command: |
+            python - <<'PY'
+            import os
+            import psycopg
+
+            with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+                with conn.cursor() as cur:
+                    for path in sorted(
+                        name for name in os.listdir("migrations")
+                        if name.endswith(".sql")
+                    ):
+                        with open(
+                            os.path.join("migrations", path),
+                            encoding="utf-8",
+                        ) as migration:
+                            cur.execute(migration.read())
+                        print(f"Applied {path}")
+            PY
+      - run:
+          name: Run integration tests
+          command: PYTHONPATH=. python -m pytest -v tests/test_integration.py
+
+  secret-scan:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run:
+          name: Scan tracked files for likely secrets
+          command: |
+            pip install detect-secrets
+            detect-secrets scan --all-files --exclude-files '(^|/)(\.git/|\.pytest_cache/|__pycache__/)' > /tmp/secrets-baseline.json
+            python - <<'PY'
+            import json
+
+            with open("/tmp/secrets-baseline.json", encoding="utf-8") as f:
+                data = json.load(f)
+
+            findings = [
+                (path, item)
+                for path, items in data.get("results", {}).items()
+                for item in items
+            ]
+
+            if findings:
+                for path, item in findings:
+                    print(
+                        f"Potential secret: {path}:"
+                        f"{item.get('line_number', '?')} "
+                        f"({item.get('type', 'unknown')})"
+                    )
+                raise SystemExit(
+                    "Potential secrets detected; review these findings."
+                )
+
+            print("No potential secrets detected.")
+            PY
+
+  build-image:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build Docker image
+          command: docker build -t game-leaderboard:ci .
+
+workflows:
+  build-test-and-scan:
+    jobs:
+      - lint
+      - unit-tests:
+          requires:
+            - lint
+      - integration-tests:
+          requires:
+            - unit-tests
+      - secret-scan:
+          requires:
+            - integration-tests
+      - build-image:
+          requires:
+            - secret-scan

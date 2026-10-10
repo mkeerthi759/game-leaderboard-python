@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: leaderboard
+      POSTGRES_USER: leaderboard
+      POSTGRES_PASSWORD: leaderboard
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leaderboard -d leaderboard"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    image: postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: leaderboard
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "for f in /migrations/*.sql; do echo Running migration: $$f; psql -h postgres -U leaderboard -d leaderboard -v ON_ERROR_STOP=1 -f \"$$f\" || exit $$?; done"
+
+  app:
+    build: .
+    image: game-leaderboard:1.0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://leaderboard:leaderboard@postgres:5432/leaderboard
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8080:8080"
+
+volumes:
+  postgres_data:
