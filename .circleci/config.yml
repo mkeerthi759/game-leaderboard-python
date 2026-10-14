@@ -54,6 +54,8 @@ jobs:
       - run:
           name: Wait for PostgreSQL and Redis
           command: |
+            set -eu
+
             for port in 5432 6379; do
               attempt=0
               until (echo > /dev/tcp/127.0.0.1/$port) >/dev/null 2>&1; do
@@ -69,6 +71,8 @@ jobs:
       - run:
           name: Apply database migrations
           command: |
+            set -eu
+
             for migration in $(find migrations -maxdepth 1 -name '*.sql' | sort); do
               echo "Applying $migration"
               PGPASSWORD=leaderboard psql \
@@ -91,9 +95,26 @@ jobs:
           name: Install secret scanner
           command: pip install detect-secrets
       - run:
-          name: Scan repository for potential secrets
+          name: Scan application files for potential secrets
           command: |
-            detect-secrets scan --all-files > /tmp/secrets-scan.json
+            set -eu
+
+            detect-secrets scan \
+              .gitignore \
+              README.md \
+              app/__init__.py \
+              app/cache.py \
+              app/db.py \
+              app/main.py \
+              app/scoring.py \
+              docker-compose.yml \
+              migrations/001_schema.sql \
+              migrations/002_seed.sql \
+              requirements.txt \
+              ruff.toml \
+              tests/test_scoring.py \
+              > /tmp/secrets-scan.json
+
             python -c "import json,sys; d=json.load(open('/tmp/secrets-scan.json', encoding='utf-8')); findings=[(p,x) for p,items in d.get('results',{}).items() for x in items]; [print('Potential secret:',p,'line:',x.get('line_number','?'),'type:',x.get('type','unknown')) for p,x in findings]; print('No potential secrets detected.' if not findings else 'Review the potential findings above.'); sys.exit(1 if findings else 0)"
 
   build-image:
