@@ -23,14 +23,7 @@ jobs:
           command: pip install -r requirements.txt pytest pytest-cov
       - run:
           name: Run unit tests with coverage
-          command: |
-            set -eu
-            PYTHONPATH=. pytest -q 
-              --cov=app.scoring 
-              --cov-report=term-missing 
-              --cov-fail-under=70 
-              tests/test_scoring.py
-
+          command: PYTHONPATH=. pytest -q --cov=app.scoring --cov-report=term-missing --cov-fail-under=70 tests/test_scoring.py
   integration-tests:
     docker:
       - image: cimg/python:3.12
