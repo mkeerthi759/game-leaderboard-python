@@ -1,4 +1,3 @@
-
 version: 2.1
 
 jobs:
@@ -25,10 +24,11 @@ jobs:
       - run:
           name: Run unit tests with coverage
           command: |
-            PYTHONPATH=. pytest -q \
-              --cov=app.scoring \
-              --cov-report=term-missing \
-              --cov-fail-under=70 \
+            set -eu
+            PYTHONPATH=. pytest -q 
+              --cov=app.scoring 
+              --cov-report=term-missing 
+              --cov-fail-under=70 
               tests/test_scoring.py
 
   integration-tests:
@@ -48,6 +48,7 @@ jobs:
       - run:
           name: Install dependencies and PostgreSQL client
           command: |
+            set -eu
             pip install -r requirements.txt pytest httpx
             sudo apt-get update
             sudo apt-get install -y postgresql-client
@@ -73,7 +74,7 @@ jobs:
           command: |
             set -eu
 
-            for migration in $(find migrations -maxdepth 1 -name '*.sql' | sort); do
+            for migration in $(find migrations -maxdepth 1 -type f -name '*.sql' | sort); do
               echo "Applying $migration"
               PGPASSWORD=leaderboard psql \
                 -h 127.0.0.1 \
@@ -95,27 +96,40 @@ jobs:
           name: Install secret scanner
           command: pip install detect-secrets
       - run:
-          name: Scan application files for potential secrets
+          name: Scan repository for potential secrets
           command: |
             set -eu
 
-            detect-secrets scan \
-              .gitignore \
-              README.md \
-              app/__init__.py \
-              app/cache.py \
-              app/db.py \
-              app/main.py \
-              app/scoring.py \
-              docker-compose.yml \
-              migrations/001_schema.sql \
-              migrations/002_seed.sql \
-              requirements.txt \
-              ruff.toml \
-              tests/test_scoring.py \
-              > /tmp/secrets-scan.json
+            detect-secrets scan --all-files > /tmp/secrets-scan.json
 
-            python -c "import json,sys; d=json.load(open('/tmp/secrets-scan.json', encoding='utf-8')); findings=[(p,x) for p,items in d.get('results',{}).items() for x in items]; [print('Potential secret:',p,'line:',x.get('line_number','?'),'type:',x.get('type','unknown')) for p,x in findings]; print('No potential secrets detected.' if not findings else 'Review the potential findings above.'); sys.exit(1 if findings else 0)"
+            python - <<'PY'
+            import json
+            import sys
+
+            with open("/tmp/secrets-scan.json", encoding="utf-8") as file:
+                data = json.load(file)
+
+            findings = [
+                (path, finding)
+                for path, items in data.get("results", {}).items()
+                for finding in items
+            ]
+
+            if findings:
+                for path, finding in findings:
+                    print(
+                        "Potential secret:",
+                        path,
+                        "line:",
+                        finding.get("line_number", "?"),
+                        "type:",
+                        finding.get("type", "unknown"),
+                    )
+                print("Secret scan failed: review the findings above.")
+                sys.exit(1)
+
+            print("Secret scan passed: no potential secrets detected.")
+            PY
 
   build-image:
     docker:
