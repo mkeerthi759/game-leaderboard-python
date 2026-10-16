@@ -1,182 +1,115 @@
 version: 2.1
 
-executors:
-  python-executor:
+jobs:
+  test:
     docker:
-      - image: cimg/python:3.11
+      - image: cimg/python:3.12
       - image: cimg/postgres:16.0
         environment:
-          POSTGRES_USER:     leaderboard
+          POSTGRES_USER: leaderboard
           POSTGRES_PASSWORD: leaderboard
-          POSTGRES_DB:       leaderboard
+          POSTGRES_DB: leaderboard
       - image: cimg/redis:7.2
+    environment:
+      DATABASE_URL: postgresql://leaderboard:leaderboard@localhost:5432/leaderboard
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - checkout
 
-jobs:
+      - run:
+          name: Install dependencies
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client redis-tools
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+            pip install pytest pytest-cov ruff
 
-  secret-scan:
+      - run:
+          name: Lint
+          command: python -m ruff check app tests
+
+      - run:
+          name: Unit tests
+          command: python -m pytest tests/test_scoring.py --cov=app.scoring --cov-report=term-missing
+
+      - run:
+          name: Wait for services
+          command: |
+            for i in $(seq 1 30); do
+              if pg_isready -h localhost -U leaderboard -d leaderboard; then
+                break
+              fi
+              sleep 2
+            done
+            pg_isready -h localhost -U leaderboard -d leaderboard
+            redis-cli -h localhost ping
+
+      - run:
+          name: Run migrations
+          command: |
+            for file in migrations/*.sql; do
+              PGPASSWORD=leaderboard psql -v ON_ERROR_STOP=1 -h localhost -U leaderboard -d leaderboard -f "$file"
+            done
+
+      - run:
+          name: Integration tests
+          command: python -m pytest tests/test_integration.py -v
+
+      - run:
+          name: Secret scan
+          command: |
+            pip install detect-secrets
+            detect-secrets scan --all-files --baseline .secrets.baseline
+
+  docker-publish:
     docker:
       - image: cimg/base:stable
     steps:
       - checkout
-      - run:
-          name: Install gitleaks
-          command: |
-            GITLEAKS_VERSION=8.18.4
-            curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-              | sudo tar -xz -C /usr/local/bin gitleaks
-            gitleaks version
-      - run:
-          name: Scan for secrets
-          command: |
-            gitleaks detect --source=. --redact --no-banner --verbose --exit-code=1
-
-  lint:
-    executor: python-executor
-    steps:
-      - checkout
-      - run:
-          name: Install dependencies
-          command: |
-            python -m venv venv
-            . venv/bin/activate
-            pip install --upgrade pip
-            pip install -r requirements.txt ruff
-      - run:
-          name: Run Ruff
-          command: |
-            . venv/bin/activate
-            ruff check app tests
-
-  unit-tests:
-    executor: python-executor
-    steps:
-      - checkout
-      - run:
-          name: Install dependencies
-          command: |
-            python -m venv venv
-            . venv/bin/activate
-            pip install --upgrade pip
-            pip install -r requirements.txt pytest pytest-cov
-      - run:
-          name: Run unit tests with coverage
-          command: |
-            . venv/bin/activate
-            PYTHONPATH=. pytest -q \
-              --cov=app.scoring \
-              --cov-report=term-missing \
-              --cov-fail-under=70 \
-              tests/test_scoring.py
-
-  integration-tests:
-
-    steps:
-      - checkout
-      - run:
-          name: Install dependencies and PostgreSQL client
-          command: |
-            python -m venv venv
-            . venv/bin/activate
-            pip install --upgrade pip
-            pip install -r requirements.txt pytest httpx
-            sudo apt-get update
-            sudo apt-get install -y postgresql-client
-      - run:
-          name: Wait for PostgreSQL and Redis
-          command: |
-            for port in 5432 6379; do
-              attempt=0
-              until (echo > /dev/tcp/127.0.0.1/$port) >/dev/null 2>&1; do
-                attempt=$((attempt + 1))
-                if [ "$attempt" -ge 60 ]; then
-                  echo "Service on port $port did not become ready"
-                  exit 1
-                fi
-                sleep 2
-              done
-              echo "Service on port $port is accepting connections"
-            done
-      - run:
-          name: Apply database migrations
-          command: |
-            for migration in $(find migrations -maxdepth 1 -name '*.sql' | sort); do
-              echo "Applying $migration"
-              PGPASSWORD=leaderboard psql \  # pragma: allowlist secret
-                -h 127.0.0.1 \
-                -U leaderboard \
-                -d leaderboard \
-                -v ON_ERROR_STOP=1 \
-                -f "$migration"
-            done
-      - run:
-          name: Run integration tests
-          command: |
-            . venv/bin/activate
-            PYTHONPATH=. python -m pytest -v tests/test_integration.py
-
-  build-and-push:
-    parameters:
-      tag:
-        type: string
-    docker:
-      - image: cimg/python:3.11
-    steps:
-      - checkout
       - setup_remote_docker
+
       - run:
-          name: Compute image tags
+          name: Log in to Docker Hub
           command: |
-            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
-            echo "export IMMUTABLE_TAG=${CIRCLE_BRANCH}-${SHORT_SHA}" >> "$BASH_ENV"
-            echo "export MOVING_TAG=<< parameters.tag >>" >> "$BASH_ENV"
-            echo "Moving tag:    ${MOVING_TAG}"
-            echo "Immutable tag: ${IMMUTABLE_TAG}"
+            echo "$DOCKERHUB_PASSWORD" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
       - run:
-          name: Build Docker image
+          name: Build and publish Docker image
           command: |
+            IMAGE="arnab1108/game-leaderboard-python"
+
+            case "$CIRCLE_BRANCH" in
+              main)
+                TAG="qa"
+                ;;
+              staging)
+                TAG="stage"
+                ;;
+              prod)
+                TAG="prod"
+                ;;
+              *)
+                echo "Publishing is not enabled for branch: $CIRCLE_BRANCH"
+                exit 1
+                ;;
+            esac
+
             docker build \
-              -t "${DOCKERHUB_USER}/game-leaderboard:${MOVING_TAG}" \
-              -t "${DOCKERHUB_USER}/game-leaderboard:${IMMUTABLE_TAG}" \
+              -t "$IMAGE:$TAG" \
+              -t "$IMAGE:$CIRCLE_SHA1" \
               .
-      - run:
-          name: Push to Docker Hub
-          command: |
-            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
-            docker push "${DOCKERHUB_USER}/game-leaderboard:${MOVING_TAG}"
-            docker push "${DOCKERHUB_USER}/game-leaderboard:${IMMUTABLE_TAG}"
+
+            docker push "$IMAGE:$TAG"
+            docker push "$IMAGE:$CIRCLE_SHA1"
 
 workflows:
-  version: 2
-
-  qa-pipeline:
+  main-pipeline:
     jobs:
-      - secret-scan:
-          filters: { branches: { only: main } }
-      - lint:
-          requires: [secret-scan]
-          filters: { branches: { only: main } }
-      - unit-tests:
-          requires: [lint]
-          filters: { branches: { only: main } }
-      - integration-tests:
-          requires: [unit-tests]
-          filters: { branches: { only: main } }
-      - build-and-push:
-          name: build-and-push-qa
-          tag: qa
-          requires: [integration-tests]
-          filters: { branches: { only: main } }
-
-  staging-pipeline:
-    jobs:
-      - build-and-push:
-          name: build-and-push-stage
-          tag: stage
-          filters: { branches: { only: staging } }
-
-  prod-pipeline:
-    jobs:
-      - build-and-push:
-          name: build-and-push-prod
-          tag: prod
-          filters: { branches: { only: prod } }
+      - test
+      - docker-publish:
+          requires:
+            - test
+          filters:
+            branches:
+              only: /^(main|staging|prod)$/
