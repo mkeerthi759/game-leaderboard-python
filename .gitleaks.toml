@@ -1,4 +1,4 @@
-﻿title = "gitleaks config"
+title = "gitleaks config"
 
 [allowlist]
 description = "Project-specific allowlist for dev-only fixtures"
