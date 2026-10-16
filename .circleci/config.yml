@@ -62,88 +62,87 @@ jobs:
           name: Run unit tests with coverage
           command: |
             . venv/bin/activate
-            PYTHONPATH=. pytest -q --cov=app.scoring --cov-report=term-missing --cov-fail-under=70 tests/test_scoring.py
+            PYTHONPATH=. pytest -q \
+              --cov=app.scoring \
+              --cov-report=term-missing \
+              --cov-fail-under=70 \
+              tests/test_scoring.py
 
   integration-tests:
     executor: python-executor
     environment:
-      DATABASE_URL: postgresql://leaderboard:leaderboard@localhost:5432/leaderboard
-      REDIS_URL:    redis://localhost:6379/0
+      DATABASE_URL: postgresql://leaderboard:leaderboard@127.0.0.1:5432/leaderboard
+      REDIS_URL:    redis://127.0.0.1:6379/0
     steps:
       - checkout
       - run:
-          name: Install dependencies
+          name: Install dependencies and PostgreSQL client
           command: |
             python -m venv venv
             . venv/bin/activate
             pip install --upgrade pip
-            pip install -r requirements.txt pytest
+            pip install -r requirements.txt pytest httpx
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
       - run:
-          name: Wait for PostgreSQL
+          name: Wait for PostgreSQL and Redis
           command: |
-            for i in $(seq 1 30); do
-              if python -c "import os, psycopg; psycopg.connect(os.environ['DATABASE_URL']).close()" 2>/dev/null; then
-                echo "PostgreSQL is ready"
-                break
-              fi
-              if [ "$i" -eq 30 ]; then
-                echo "PostgreSQL did not become ready in time" >&2
-                exit 1
-              fi
-              echo "Waiting for PostgreSQL... ($i/30)"
-              sleep 2
-            done
-      - run:
-          name: Wait for Redis
-          command: |
-            for i in $(seq 1 30); do
-              if python -c "import os, redis; redis.Redis.from_url(os.environ['REDIS_URL']).ping()" 2>/dev/null; then
-                echo "Redis is ready"
-                break
-              fi
-              if [ "$i" -eq 30 ]; then
-                echo "Redis did not become ready in time" >&2
-                exit 1
-              fi
-              echo "Waiting for Redis... ($i/30)"
-              sleep 2
+            for port in 5432 6379; do
+              attempt=0
+              until (echo > /dev/tcp/127.0.0.1/$port) >/dev/null 2>&1; do
+                attempt=$((attempt + 1))
+                if [ "$attempt" -ge 60 ]; then
+                  echo "Service on port $port did not become ready"
+                  exit 1
+                fi
+                sleep 2
+              done
+              echo "Service on port $port is accepting connections"
             done
       - run:
           name: Apply database migrations
           command: |
-            python -c "import os; from pathlib import Path; import psycopg; conn=psycopg.connect(os.environ['DATABASE_URL']); conn.execute((Path('migrations') / '001_schema.sql').read_text(encoding='utf-8'), prepare=False); conn.execute((Path('migrations') / '002_seed.sql').read_text(encoding='utf-8'), prepare=False); conn.commit(); conn.close(); print('Database migrations completed successfully')"
+            for migration in $(find migrations -maxdepth 1 -name '*.sql' | sort); do
+              echo "Applying $migration"
+              PGPASSWORD=leaderboard psql \
+                -h 127.0.0.1 \
+                -U leaderboard \
+                -d leaderboard \
+                -v ON_ERROR_STOP=1 \
+                -f "$migration"
+            done
       - run:
           name: Run integration tests
           command: |
             . venv/bin/activate
-            PYTHONPATH=. pytest -q tests/test_integration.py
+            PYTHONPATH=. python -m pytest -v tests/test_integration.py
 
   build-and-push:
     parameters:
       tag:
         type: string
-        description: "Moving tag (qa / stage / prod)"
     docker:
       - image: cimg/python:3.11
     steps:
       - checkout
-      - setup_remote_docker:
-          version: docker24
+      - setup_remote_docker
       - run:
           name: Compute image tags
           command: |
             SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
             echo "export IMMUTABLE_TAG=${CIRCLE_BRANCH}-${SHORT_SHA}" >> "$BASH_ENV"
             echo "export MOVING_TAG=<< parameters.tag >>" >> "$BASH_ENV"
+            echo "Moving tag:    ${MOVING_TAG}"
+            echo "Immutable tag: ${IMMUTABLE_TAG}"
       - run:
-          name: Build image
+          name: Build Docker image
           command: |
             docker build \
               -t "${DOCKERHUB_USER}/game-leaderboard:${MOVING_TAG}" \
               -t "${DOCKERHUB_USER}/game-leaderboard:${IMMUTABLE_TAG}" \
               .
       - run:
-          name: Push image
+          name: Push to Docker Hub
           command: |
             echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
             docker push "${DOCKERHUB_USER}/game-leaderboard:${MOVING_TAG}"
