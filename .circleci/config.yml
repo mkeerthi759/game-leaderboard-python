@@ -1,117 +1,178 @@
-
 version: 2.1
 
-jobs:
-  lint:
+executors:
+  python-executor:
     docker:
-      - image: cimg/python:3.12
-    steps:
-      - checkout
-      - run:
-          name: Install dependencies and Ruff
-          command: pip install -r requirements.txt ruff
-      - run:
-          name: Run Ruff
-          command: ruff check app tests
-
-  unit-tests:
-    docker:
-      - image: cimg/python:3.12
-    steps:
-      - checkout
-      - run:
-          name: Install test dependencies
-          command: pip install -r requirements.txt pytest pytest-cov
-      - run:
-          name: Run unit tests with coverage
-          command: PYTHONPATH=. pytest -q --cov=app.scoring --cov-report=term-missing --cov-fail-under=70 tests/test_scoring.py
-
-  integration-tests:
-    docker:
-      - image: cimg/python:3.12
+      - image: cimg/python:3.11
+      - image: cimg/postgres:16.0
         environment:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/testdb
-          REDIS_URL: redis://localhost:6379/0
-      - image: cimg/postgres:16.4
-        environment:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: testdb
-      - image: redis:7-alpine
+          POSTGRES_USER:     leaderboard
+          POSTGRES_PASSWORD: leaderboard
+          POSTGRES_DB:       leaderboard
+      - image: cimg/redis:7.2
 
+commands:
+  install-deps:
+    description: "Install Python dependencies"
     steps:
-      - checkout
-
       - run:
-          name: Install test dependencies
-          command: pip install -r requirements.txt pytest
-
-      - run:
-          name: Wait for Postgres to be ready
+          name: Install dependencies
           command: |
-            set -eu
+            python -m venv venv
+            . venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt
+
+  wait-for-db:
+    description: "Wait until Postgres accepts connections"
+    steps:
+      - run:
+          name: Wait for Postgres
+          command: |
             for i in $(seq 1 30); do
-              if pg_isready -h localhost -p 5432 -U postgres; then
-                echo "Postgres is ready"
-                exit 0
-              fi
-              echo "Waiting for Postgres... ($i/30)"
+              pg_isready -h localhost -p 5432 -U leaderboard && break
+              echo "Waiting for Postgres… ($i)"
               sleep 2
             done
-            echo "Postgres did not become ready in time" >&2
-            exit 1
 
+  wait-for-redis:
+    description: "Wait until Redis accepts connections"
+    steps:
       - run:
-          name: Wait for Redis to be ready
+          name: Wait for Redis
           command: |
-            python - <<'PY'
-            import os
-            import time
-            import redis
+            for i in $(seq 1 30); do
+              redis-cli -h localhost ping && break
+              echo "Waiting for Redis… ($i)"
+              sleep 2
+            done
 
-            client = redis.Redis.from_url(os.environ["REDIS_URL"])
+jobs:
 
-            for attempt in range(30):
-                try:
-                    client.ping()
-                    print("Redis is ready")
-                    break
-                except redis.RedisError:
-                    if attempt == 29:
-                        raise
-                    print(f"Waiting for Redis... ({attempt + 1}/30)")
-                    time.sleep(2)
-            PY
-
+  secret-scan:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
       - run:
-          name: Apply database migrations
+          name: Install gitleaks
           command: |
-            python - <<'PY'
-            import os
-            from pathlib import Path
-            import psycopg
+            GITLEAKS_VERSION=8.18.4
+            curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+              | sudo tar -xz -C /usr/local/bin gitleaks
+            gitleaks version
+      - run:
+          name: Scan for secrets
+          command: |
+            gitleaks detect --source=. --redact --no-banner --verbose --exit-code=1
 
-            migrations = Path("migrations")
+  lint:
+    executor: python-executor
+    steps:
+      - checkout
+      - install-deps
+      - run:
+          name: Run linter
+          command: |
+            . venv/bin/activate
+            pip install ruff
+            ruff check .
 
-            with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
-                for filename in ("001_schema.sql", "002_seed.sql"):
-                    sql = (migrations / filename).read_text(encoding="utf-8")
-                    conn.execute(sql, prepare=False)
-                    print(f"Applied {filename}")
+  unit-tests:
+    executor: python-executor
+    steps:
+      - checkout
+      - install-deps
+      - run:
+          name: Run unit tests
+          command: |
+            . venv/bin/activate
+            pytest tests/ -v -m "not integration"
 
-            print("Database migrations completed successfully")
-            PY
-
+  integration-tests:
+    executor: python-executor
+    environment:
+      DATABASE_URL: postgresql://leaderboard:leaderboard@localhost:5432/leaderboard
+      REDIS_URL:    redis://localhost:6379/0
+    steps:
+      - checkout
+      - install-deps
+      - wait-for-db
+      - wait-for-redis
+      - run:
+          name: Run migrations
+          command: |
+            . venv/bin/activate
+            alembic upgrade head
       - run:
           name: Run integration tests
-          command: PYTHONPATH=. pytest -q tests/test_integration.py
+          command: |
+            . venv/bin/activate
+            pytest tests/ -v -m integration
+
+  build-and-push:
+    parameters:
+      tag:
+        type: string
+        description: "Moving tag (:qa / :stage / :prod)"
+    docker:
+      - image: cimg/python:3.11
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: docker24
+      - run:
+          name: Compute image tags
+          command: |
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
+            echo "export IMMUTABLE_TAG=${CIRCLE_BRANCH}-${SHORT_SHA}" >> "$BASH_ENV"
+            echo "export MOVING_TAG=<< parameters.tag >>" >> "$BASH_ENV"
+      - run:
+          name: Build image
+          command: |
+            docker build \
+              -t "${DOCKERHUB_USER}/game-leaderboard:${MOVING_TAG}" \
+              -t "${DOCKERHUB_USER}/game-leaderboard:${IMMUTABLE_TAG}" \
+              .
+      - run:
+          name: Push image
+          command: |
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+            docker push "${DOCKERHUB_USER}/game-leaderboard:${MOVING_TAG}"
+            docker push "${DOCKERHUB_USER}/game-leaderboard:${IMMUTABLE_TAG}"
 
 workflows:
-  build-test-and-scan:
+  version: 2
+
+  qa-pipeline:
     jobs:
-      - lint
-      - unit-tests
+      - secret-scan:
+          filters: { branches: { only: main } }
+      - lint:
+          requires: [secret-scan]
+          filters: { branches: { only: main } }
+      - unit-tests:
+          requires: [lint]
+          filters: { branches: { only: main } }
       - integration-tests:
-          requires:
-            - lint
-            - unit-tests
+          requires: [unit-tests]
+          filters: { branches: { only: main } }
+      - build-and-push:
+          name: build-and-push-qa
+          tag: qa
+          requires: [integration-tests]
+          filters: { branches: { only: main } }
+
+  staging-pipeline:
+    jobs:
+      - build-and-push:
+          name: build-and-push-stage
+          tag: stage
+          filters: { branches: { only: staging } }
+
+  prod-pipeline:
+    jobs:
+      - build-and-push:
+          name: build-and-push-prod
+          tag: prod
+          filters: { branches: { only: prod } }
