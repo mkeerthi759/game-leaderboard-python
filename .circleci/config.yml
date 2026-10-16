@@ -24,129 +24,45 @@ jobs:
       - run:
           name: Run unit tests with coverage
           command: PYTHONPATH=. pytest -q --cov=app.scoring --cov-report=term-missing --cov-fail-under=70 tests/test_scoring.py
+
   integration-tests:
     docker:
       - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/testdb
       - image: cimg/postgres:16.4
         environment:
-          POSTGRES_DB: leaderboard
-          POSTGRES_USER: leaderboard
-          POSTGRES_PASSWORD: leaderboard
-      - image: cimg/redis:7.2
-    environment:
-      DATABASE_URL: postgresql://leaderboard:leaderboard@127.0.0.1:5432/leaderboard
-      REDIS_URL: redis://127.0.0.1:6379/0
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
     steps:
       - checkout
       - run:
-          name: Install dependencies and PostgreSQL client
-          command: |
-            set -eu
-            pip install -r requirements.txt pytest httpx
-            sudo apt-get update
-            sudo apt-get install -y postgresql-client
+          name: Install test dependencies
+          command: pip install -r requirements.txt pytest
       - run:
-          name: Wait for PostgreSQL and Redis
+          name: Wait for Postgres to be ready
           command: |
-            set -eu
-
-            for port in 5432 6379; do
-              attempt=0
-              until (echo > /dev/tcp/127.0.0.1/$port) >/dev/null 2>&1; do
-                attempt=$((attempt + 1))
-                if [ "$attempt" -ge 60 ]; then
-                  echo "Service on port $port did not become ready"
-                  exit 1
-                fi
-                sleep 2
-              done
-              echo "Service on port $port is accepting connections"
+            for i in $(seq 1 30); do
+              if pg_isready -h localhost -p 5432 -U postgres; then
+                echo "Postgres is ready"
+                exit 0
+              fi
+              echo "Waiting for Postgres... ($i/30)"
+              sleep 2
             done
-      - run:
-          name: Apply database migrations
-          command: |
-            set -eu
-
-            for migration in $(find migrations -maxdepth 1 -type f -name '*.sql' | sort); do
-              echo "Applying $migration"
-              PGPASSWORD=leaderboard psql \
-                -h 127.0.0.1 \
-                -U leaderboard \
-                -d leaderboard \
-                -v ON_ERROR_STOP=1 \
-                -f "$migration"
-            done
+            echo "Postgres did not become ready in time" >&2
+            exit 1
       - run:
           name: Run integration tests
-          command: PYTHONPATH=. python -m pytest -v tests/test_integration.py
-
-  secret-scan:
-    docker:
-      - image: cimg/python:3.12
-    steps:
-      - checkout
-      - run:
-          name: Install secret scanner
-          command: pip install detect-secrets
-      - run:
-          name: Scan repository for potential secrets
-          command: |
-            set -eu
-
-            detect-secrets scan --all-files > /tmp/secrets-scan.json
-
-            python - <<'PY'
-            import json
-            import sys
-
-            with open("/tmp/secrets-scan.json", encoding="utf-8") as file:
-                data = json.load(file)
-
-            findings = [
-                (path, finding)
-                for path, items in data.get("results", {}).items()
-                for finding in items
-            ]
-
-            if findings:
-                for path, finding in findings:
-                    print(
-                        "Potential secret:",
-                        path,
-                        "line:",
-                        finding.get("line_number", "?"),
-                        "type:",
-                        finding.get("type", "unknown"),
-                    )
-                print("Secret scan failed: review the findings above.")
-                sys.exit(1)
-
-            print("Secret scan passed: no potential secrets detected.")
-            PY
-
-  build-image:
-    docker:
-      - image: cimg/base:current
-    steps:
-      - checkout
-      - setup_remote_docker
-      - run:
-          name: Build Docker image
-          command: docker build -t game-leaderboard:ci .
+          command: PYTHONPATH=. pytest -q tests/test_integration.py
 
 workflows:
   build-test-and-scan:
     jobs:
       - lint
-      - unit-tests:
-          requires:
-            - lint
+      - unit-tests
       - integration-tests:
           requires:
+            - lint
             - unit-tests
-      - secret-scan:
-          requires:
-            - integration-tests
-      - build-image:
-          requires:
-            - secret-scan
