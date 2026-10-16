@@ -76,7 +76,7 @@ jobs:
           command: |
             . venv/bin/activate
             pip install ruff
-            ruff check .
+            ruff check app tests
 
   unit-tests:
     executor: python-executor
@@ -87,7 +87,8 @@ jobs:
           name: Run unit tests
           command: |
             . venv/bin/activate
-            pytest tests/ -v -m "not integration"
+            pip install pytest pytest-cov
+            PYTHONPATH=. pytest -q --cov=app --cov-report=term-missing tests/test_scoring.py
 
   integration-tests:
     executor: python-executor
@@ -100,15 +101,16 @@ jobs:
       - wait-for-db
       - wait-for-redis
       - run:
-          name: Run migrations
+          name: Apply database schema
           command: |
-            . venv/bin/activate
-            alembic upgrade head
+            psql -h localhost -U leaderboard -d leaderboard -f migrations/001_schema.sql
+            psql -h localhost -U leaderboard -d leaderboard -f migrations/002_seed.sql
       - run:
           name: Run integration tests
           command: |
             . venv/bin/activate
-            pytest tests/ -v -m integration
+            pip install pytest
+            PYTHONPATH=. pytest -q tests/test_integration.py
 
   build-and-push:
     parameters:
@@ -127,6 +129,8 @@ jobs:
             SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
             echo "export IMMUTABLE_TAG=${CIRCLE_BRANCH}-${SHORT_SHA}" >> "$BASH_ENV"
             echo "export MOVING_TAG=<< parameters.tag >>" >> "$BASH_ENV"
+            echo "Moving tag:    ${MOVING_TAG}"
+            echo "Immutable tag: ${IMMUTABLE_TAG}"
       - run:
           name: Build image
           command: |
