@@ -69,10 +69,7 @@ jobs:
               tests/test_scoring.py
 
   integration-tests:
-    executor: python-executor
-    environment:
-      DATABASE_URL: postgresql://leaderboard:leaderboard@127.0.0.1:5432/leaderboard
-      REDIS_URL:    redis://127.0.0.1:6379/0
+
     steps:
       - checkout
       - run:
@@ -104,7 +101,7 @@ jobs:
           command: |
             for migration in $(find migrations -maxdepth 1 -name '*.sql' | sort); do
               echo "Applying $migration"
-              PGPASSWORD=leaderboard psql \
+              PGPASSWORD=leaderboard psql \  # pragma: allowlist secret
                 -h 127.0.0.1 \
                 -U leaderboard \
                 -d leaderboard \
