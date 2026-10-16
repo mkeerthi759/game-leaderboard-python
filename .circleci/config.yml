@@ -1,3 +1,4 @@
+
 version: 2.1
 
 jobs:
@@ -30,19 +31,25 @@ jobs:
       - image: cimg/python:3.12
         environment:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/testdb
+          REDIS_URL: redis://localhost:6379/0
       - image: cimg/postgres:16.4
         environment:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: testdb
+      - image: redis:7-alpine
+
     steps:
       - checkout
+
       - run:
           name: Install test dependencies
           command: pip install -r requirements.txt pytest
+
       - run:
           name: Wait for Postgres to be ready
           command: |
+            set -eu
             for i in $(seq 1 30); do
               if pg_isready -h localhost -p 5432 -U postgres; then
                 echo "Postgres is ready"
@@ -53,6 +60,48 @@ jobs:
             done
             echo "Postgres did not become ready in time" >&2
             exit 1
+
+      - run:
+          name: Wait for Redis to be ready
+          command: |
+            python - <<'PY'
+            import os
+            import time
+            import redis
+
+            client = redis.Redis.from_url(os.environ["REDIS_URL"])
+
+            for attempt in range(30):
+                try:
+                    client.ping()
+                    print("Redis is ready")
+                    break
+                except redis.RedisError:
+                    if attempt == 29:
+                        raise
+                    print(f"Waiting for Redis... ({attempt + 1}/30)")
+                    time.sleep(2)
+            PY
+
+      - run:
+          name: Apply database migrations
+          command: |
+            python - <<'PY'
+            import os
+            from pathlib import Path
+            import psycopg
+
+            migrations = Path("migrations")
+
+            with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+                for filename in ("001_schema.sql", "002_seed.sql"):
+                    sql = (migrations / filename).read_text(encoding="utf-8")
+                    conn.execute(sql, prepare=False)
+                    print(f"Applied {filename}")
+
+            print("Database migrations completed successfully")
+            PY
+
       - run:
           name: Run integration tests
           command: PYTHONPATH=. pytest -q tests/test_integration.py
