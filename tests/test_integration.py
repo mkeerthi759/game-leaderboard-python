@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 # Use Docker Compose defaults locally, but preserve URLs provided by CircleCI.
 os.environ.setdefault(
     "DATABASE_URL",
-    "postgresql://leaderboard:leaderboard@postgres:5432/leaderboard",
+    "postgresql://leaderboard:leaderboard@postgres:5432/leaderboard",  # pragma: allowlist secret
 )
 os.environ.setdefault("REDIS_URL", "redis://redis:6379/0")
 
