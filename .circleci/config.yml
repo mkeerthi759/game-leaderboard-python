@@ -38,10 +38,10 @@ jobs:
         environment:
           POSTGRES_DB: leaderboard
           POSTGRES_USER: leaderboard
-          POSTGRES_PASSWORD: leaderboard
+          POSTGRES_PASSWORD: leaderboard  # pragma: allowlist secret
       - image: cimg/redis:7.2
     environment:
-      DATABASE_URL: postgresql://leaderboard:leaderboard@127.0.0.1:5432/leaderboard
+      DATABASE_URL: postgresql://leaderboard:leaderboard@127.0.0.1:5432/leaderboard  # pragma: allowlist secret
       REDIS_URL: redis://127.0.0.1:6379/0
     steps:
       - checkout
@@ -71,7 +71,7 @@ jobs:
           command: |
             for migration in $(find migrations -maxdepth 1 -name '*.sql' | sort); do
               echo "Applying $migration"
-              PGPASSWORD=leaderboard psql \
+              PGPASSWORD=leaderboard psql \  # pragma: allowlist secret
                 -h 127.0.0.1 \
                 -U leaderboard \
                 -d leaderboard \
