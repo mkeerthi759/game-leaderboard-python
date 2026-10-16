@@ -1,30 +1,67 @@
-
 version: 2.1
 
-jobs:
-  lint:
+executors:
+  python-executor:
     docker:
-      - image: cimg/python:3.12
+      - image: cimg/python:3.11
+      - image: cimg/postgres:16.0
+        environment:
+          POSTGRES_USER:     leaderboard
+          POSTGRES_PASSWORD: leaderboard
+          POSTGRES_DB:       leaderboard
+      - image: cimg/redis:7.2
+
+jobs:
+
+  secret-scan:
+    docker:
+      - image: cimg/base:stable
     steps:
       - checkout
       - run:
-          name: Install dependencies and Ruff
-          command: pip install -r requirements.txt ruff
+          name: Install gitleaks
+          command: |
+            GITLEAKS_VERSION=8.18.4
+            curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+              | sudo tar -xz -C /usr/local/bin gitleaks
+            gitleaks version
+      - run:
+          name: Scan for secrets
+          command: |
+            gitleaks detect --source=. --redact --no-banner --verbose --exit-code=1
+
+  lint:
+    executor: python-executor
+    steps:
+      - checkout
+      - run:
+          name: Install dependencies
+          command: |
+            python -m venv venv
+            . venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt ruff
       - run:
           name: Run Ruff
-          command: ruff check app tests
+          command: |
+            . venv/bin/activate
+            ruff check app tests
 
   unit-tests:
-    docker:
-      - image: cimg/python:3.12
+    executor: python-executor
     steps:
       - checkout
       - run:
-          name: Install test dependencies
-          command: pip install -r requirements.txt pytest pytest-cov
+          name: Install dependencies
+          command: |
+            python -m venv venv
+            . venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt pytest pytest-cov
       - run:
           name: Run unit tests with coverage
           command: |
+            . venv/bin/activate
             PYTHONPATH=. pytest -q \
               --cov=app.scoring \
               --cov-report=term-missing \
@@ -32,22 +69,15 @@ jobs:
               tests/test_scoring.py
 
   integration-tests:
-    docker:
-      - image: cimg/python:3.12
-      - image: cimg/postgres:16.4
-        environment:
-          POSTGRES_DB: leaderboard
-          POSTGRES_USER: leaderboard
-          POSTGRES_PASSWORD: leaderboard  # pragma: allowlist secret
-      - image: cimg/redis:7.2
-    environment:
-      DATABASE_URL: postgresql://leaderboard:leaderboard@127.0.0.1:5432/leaderboard  # pragma: allowlist secret
-      REDIS_URL: redis://127.0.0.1:6379/0
+
     steps:
       - checkout
       - run:
           name: Install dependencies and PostgreSQL client
           command: |
+            python -m venv venv
+            . venv/bin/activate
+            pip install --upgrade pip
             pip install -r requirements.txt pytest httpx
             sudo apt-get update
             sudo apt-get install -y postgresql-client
@@ -80,45 +110,73 @@ jobs:
             done
       - run:
           name: Run integration tests
-          command: PYTHONPATH=. python -m pytest -v tests/test_integration.py
-
-  secret-scan:
-    docker:
-      - image: cimg/python:3.12
-    steps:
-      - checkout
-      - run:
-          name: Install secret scanner
-          command: pip install detect-secrets
-      - run:
-          name: Scan repository for potential secrets
           command: |
-            detect-secrets scan --all-files > /tmp/secrets-scan.json
-            python -c "import json,sys; d=json.load(open('/tmp/secrets-scan.json', encoding='utf-8')); findings=[(p,x) for p,items in d.get('results',{}).items() for x in items]; [print('Potential secret:',p,'line:',x.get('line_number','?'),'type:',x.get('type','unknown')) for p,x in findings]; print('No potential secrets detected.' if not findings else 'Review the potential findings above.'); sys.exit(1 if findings else 0)"
+            . venv/bin/activate
+            PYTHONPATH=. python -m pytest -v tests/test_integration.py
 
-  build-image:
+  build-and-push:
+    parameters:
+      tag:
+        type: string
     docker:
-      - image: cimg/base:current
+      - image: cimg/python:3.11
     steps:
       - checkout
       - setup_remote_docker
       - run:
+          name: Compute image tags
+          command: |
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
+            echo "export IMMUTABLE_TAG=${CIRCLE_BRANCH}-${SHORT_SHA}" >> "$BASH_ENV"
+            echo "export MOVING_TAG=<< parameters.tag >>" >> "$BASH_ENV"
+            echo "Moving tag:    ${MOVING_TAG}"
+            echo "Immutable tag: ${IMMUTABLE_TAG}"
+      - run:
           name: Build Docker image
-          command: docker build -t game-leaderboard:ci .
+          command: |
+            docker build \
+              -t "${DOCKERHUB_USER}/game-leaderboard:${MOVING_TAG}" \
+              -t "${DOCKERHUB_USER}/game-leaderboard:${IMMUTABLE_TAG}" \
+              .
+      - run:
+          name: Push to Docker Hub
+          command: |
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+            docker push "${DOCKERHUB_USER}/game-leaderboard:${MOVING_TAG}"
+            docker push "${DOCKERHUB_USER}/game-leaderboard:${IMMUTABLE_TAG}"
 
 workflows:
-  build-test-and-scan:
+  version: 2
+
+  qa-pipeline:
     jobs:
-      - lint
-      - unit-tests:
-          requires:
-            - lint
-      - integration-tests:
-          requires:
-            - unit-tests
       - secret-scan:
-          requires:
-            - integration-tests
-      - build-image:
-          requires:
-            - secret-scan
+          filters: { branches: { only: main } }
+      - lint:
+          requires: [secret-scan]
+          filters: { branches: { only: main } }
+      - unit-tests:
+          requires: [lint]
+          filters: { branches: { only: main } }
+      - integration-tests:
+          requires: [unit-tests]
+          filters: { branches: { only: main } }
+      - build-and-push:
+          name: build-and-push-qa
+          tag: qa
+          requires: [integration-tests]
+          filters: { branches: { only: main } }
+
+  staging-pipeline:
+    jobs:
+      - build-and-push:
+          name: build-and-push-stage
+          tag: stage
+          filters: { branches: { only: staging } }
+
+  prod-pipeline:
+    jobs:
+      - build-and-push:
+          name: build-and-push-prod
+          tag: prod
+          filters: { branches: { only: prod } }

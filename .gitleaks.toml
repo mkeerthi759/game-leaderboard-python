@@ -1,0 +1,9 @@
+title = "gitleaks config"
+
+[allowlist]
+description = "Project-specific allowlist for dev-only fixtures"
+paths = [
+  '''tests/.*''',
+  '''docker-compose\.yml''',
+  '''\.circleci/config\.yml''',
+]

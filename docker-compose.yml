@@ -2,11 +2,9 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: leaderboard
-      POSTGRES_USER: leaderboard
-      POSTGRES_PASSWORD: leaderboard  # pragma: allowlist secret
+
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U leaderboard -d leaderboard"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -27,12 +25,12 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      PGPASSWORD: leaderboard  # pragma: allowlist secret
+
     volumes:
       - ./migrations:/migrations:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - "for f in /migrations/*.sql; do echo Running migration: $$f; psql -h postgres -U leaderboard -d leaderboard -v ON_ERROR_STOP=1 -f \"$$f\" || exit $$?; done"
+      - 'for f in /migrations/*.sql; do echo "Running migration: $$f"; psql -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -f "$$f" || exit $$?; done'
 
   app:
     build: .
@@ -45,7 +43,7 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      DATABASE_URL: postgresql://leaderboard:leaderboard@postgres:5432/leaderboard  # pragma: allowlist secret
+
       REDIS_URL: redis://redis:6379/0
     ports:
       - "8080:8080"
