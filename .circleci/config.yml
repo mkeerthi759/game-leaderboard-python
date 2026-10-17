@@ -1,115 +1,170 @@
 version: 2.1
 
+commands:
+  build-and-push:
+    parameters:
+      moving_tag:
+        type: string
+      branch_name:
+        type: string
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build image
+          command: |
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
+            IMAGE="$DOCKERHUB_USER/game-leaderboard-python"
+            docker build -t "$IMAGE:<< parameters.moving_tag >>" -t "$IMAGE:<< parameters.branch_name >>-$SHORT_SHA" .
+      - run:
+          name: Login to Docker Hub
+          command: echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+      - run:
+          name: Push both tags
+          command: |
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
+            IMAGE="$DOCKERHUB_USER/game-leaderboard-python"
+            docker push "$IMAGE:<< parameters.moving_tag >>"
+            docker push "$IMAGE:<< parameters.branch_name >>-$SHORT_SHA"
+
 jobs:
-  test:
+  secret-scan:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Install gitleaks
+          command: |
+            curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz | tar -xz gitleaks
+            sudo mv gitleaks /usr/local/bin/
+      - run:
+          name: Scan repository for secrets
+          command: gitleaks detect --source . --verbose --redact
+
+  lint:
     docker:
       - image: cimg/python:3.12
-      - image: cimg/postgres:16.0
+    steps:
+      - checkout
+      - run: pip install -r requirements.txt
+      - run: pip install flake8
+      - run:
+          name: Lint
+          command: flake8 . --max-line-length=120 --exclude=venv,.venv,migrations
+
+  unit-tests:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run: pip install -r requirements.txt
+      - run: pip install pytest
+      - run:
+          name: Unit tests
+          command: pytest tests/unit
+
+  integration-tests:
+    docker:
+      - image: cimg/python:3.12
+        environment:
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_USER: leaderboard
+          DB_PASSWORD: leaderboard
+          DB_NAME: leaderboard
+          DATABASE_URL: postgresql://leaderboard:leaderboard@localhost:5432/leaderboard
+          REDIS_HOST: localhost
+          REDIS_URL: redis://localhost:6379/0
+      - image: cimg/postgres:16.3
         environment:
           POSTGRES_USER: leaderboard
           POSTGRES_PASSWORD: leaderboard
           POSTGRES_DB: leaderboard
       - image: cimg/redis:7.2
-    environment:
-      DATABASE_URL: postgresql://leaderboard:leaderboard@localhost:5432/leaderboard
-      REDIS_URL: redis://localhost:6379/0
     steps:
       - checkout
-
+      - run: pip install -r requirements.txt
+      - run: pip install pytest
       - run:
-          name: Install dependencies
+          name: Wait for Postgres
+          command: dockerize -wait tcp://localhost:5432 -timeout 60s
+      - run:
+          name: Apply migrations
+          environment:
+            PGPASSWORD: leaderboard
           command: |
-            sudo apt-get update
-            sudo apt-get install -y postgresql-client redis-tools
-            python -m pip install --upgrade pip
-            pip install -r requirements.txt
-            pip install pytest pytest-cov ruff
-
-      - run:
-          name: Lint
-          command: python -m ruff check app tests
-
-      - run:
-          name: Unit tests
-          command: python -m pytest tests/test_scoring.py --cov=app.scoring --cov-report=term-missing
-
-      - run:
-          name: Wait for services
-          command: |
-            for i in $(seq 1 30); do
-              if pg_isready -h localhost -U leaderboard -d leaderboard; then
-                break
-              fi
-              sleep 2
+            for migration in $(find migrations -maxdepth 1 -name '*.sql' | sort); do
+              echo "Applying $migration"
+              psql -h 127.0.0.1 -U leaderboard -d leaderboard \
+                -v ON_ERROR_STOP=1 -f "$migration"
             done
-            pg_isready -h localhost -U leaderboard -d leaderboard
-            redis-cli -h localhost ping
-
-      - run:
-          name: Run migrations
-          command: |
-            for file in migrations/*.sql; do
-              PGPASSWORD=leaderboard psql -v ON_ERROR_STOP=1 -h localhost -U leaderboard -d leaderboard -f "$file"
-            done
-
       - run:
           name: Integration tests
-          command: python -m pytest tests/test_integration.py -v
+          command: pytest tests/integration
 
-      - run:
-          name: Secret scan
-          command: |
-            pip install detect-secrets
-            detect-secrets scan --all-files --baseline .secrets.baseline
-
-  docker-publish:
+  build-image-qa:
     docker:
       - image: cimg/base:stable
     steps:
-      - checkout
-      - setup_remote_docker
+      - build-and-push:
+          moving_tag: qa
+          branch_name: main
 
-      - run:
-          name: Log in to Docker Hub
-          command: |
-            echo "$DOCKERHUB_PASSWORD" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+  build-image-stage:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - build-and-push:
+          moving_tag: stage
+          branch_name: staging
 
-      - run:
-          name: Build and publish Docker image
-          command: |
-            IMAGE="arnab1108/game-leaderboard-python"
-
-            case "$CIRCLE_BRANCH" in
-              main)
-                TAG="qa"
-                ;;
-              staging)
-                TAG="stage"
-                ;;
-              prod)
-                TAG="prod"
-                ;;
-              *)
-                echo "Publishing is not enabled for branch: $CIRCLE_BRANCH"
-                exit 1
-                ;;
-            esac
-
-            docker build \
-              -t "$IMAGE:$TAG" \
-              -t "$IMAGE:$CIRCLE_SHA1" \
-              .
-
-            docker push "$IMAGE:$TAG"
-            docker push "$IMAGE:$CIRCLE_SHA1"
+  build-image-prod:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - build-and-push:
+          moving_tag: prod
+          branch_name: prod
 
 workflows:
-  main-pipeline:
+  qa-pipeline:
     jobs:
-      - test
-      - docker-publish:
-          requires:
-            - test
+      - secret-scan:
           filters:
             branches:
-              only: /^(main|staging|prod)$/
+              only: main
+      - lint:
+          requires: [secret-scan]
+          filters:
+            branches:
+              only: main
+      - unit-tests:
+          requires: [lint]
+          filters:
+            branches:
+              only: main
+      - integration-tests:
+          requires: [unit-tests]
+          filters:
+            branches:
+              only: main
+      - build-image-qa:
+          requires: [integration-tests]
+          filters:
+            branches:
+              only: main
+
+  stage-pipeline:
+    jobs:
+      - build-image-stage:
+          filters:
+            branches:
+              only: staging
+
+  prod-pipeline:
+    jobs:
+      - build-image-prod:
+          filters:
+            branches:
+              only: prod
