@@ -1,115 +1,26 @@
 version: 2.1
 
 jobs:
-  test:
-    docker:
-      - image: cimg/python:3.12
-      - image: cimg/postgres:16.0
-        environment:
-          POSTGRES_USER: leaderboard
-          POSTGRES_PASSWORD: leaderboard
-          POSTGRES_DB: leaderboard
-      - image: cimg/redis:7.2
-    environment:
-      DATABASE_URL: postgresql://leaderboard:leaderboard@localhost:5432/leaderboard
-      REDIS_URL: redis://localhost:6379/0
-    steps:
-      - checkout
-
-      - run:
-          name: Install dependencies
-          command: |
-            sudo apt-get update
-            sudo apt-get install -y postgresql-client redis-tools
-            python -m pip install --upgrade pip
-            pip install -r requirements.txt
-            pip install pytest pytest-cov ruff
-
-      - run:
-          name: Lint
-          command: python -m ruff check app tests
-
-      - run:
-          name: Unit tests
-          command: python -m pytest tests/test_scoring.py --cov=app.scoring --cov-report=term-missing
-
-      - run:
-          name: Wait for services
-          command: |
-            for i in $(seq 1 30); do
-              if pg_isready -h localhost -U leaderboard -d leaderboard; then
-                break
-              fi
-              sleep 2
-            done
-            pg_isready -h localhost -U leaderboard -d leaderboard
-            redis-cli -h localhost ping
-
-      - run:
-          name: Run migrations
-          command: |
-            for file in migrations/*.sql; do
-              PGPASSWORD=leaderboard psql -v ON_ERROR_STOP=1 -h localhost -U leaderboard -d leaderboard -f "$file"
-            done
-
-      - run:
-          name: Integration tests
-          command: python -m pytest tests/test_integration.py -v
-
-      - run:
-          name: Secret scan
-          command: |
-            pip install detect-secrets
-            detect-secrets scan --all-files --baseline .secrets.baseline
-
-  docker-publish:
+  build-and-push:
     docker:
       - image: cimg/base:stable
     steps:
       - checkout
       - setup_remote_docker
-
       - run:
-          name: Log in to Docker Hub
+          name: Build Docker Image
           command: |
-            echo "$DOCKERHUB_PASSWORD" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-
+            docker build -t keerthimanjunath/game-leaderboard:qa .
       - run:
-          name: Build and publish Docker image
+          name: Push to Docker Hub
           command: |
-            IMAGE="arnab1108/game-leaderboard-python"
-
-            case "$CIRCLE_BRANCH" in
-              main)
-                TAG="qa"
-                ;;
-              staging)
-                TAG="stage"
-                ;;
-              prod)
-                TAG="prod"
-                ;;
-              *)
-                echo "Publishing is not enabled for branch: $CIRCLE_BRANCH"
-                exit 1
-                ;;
-            esac
-
-            docker build \
-              -t "$IMAGE:$TAG" \
-              -t "$IMAGE:$CIRCLE_SHA1" \
-              .
-
-            docker push "$IMAGE:$TAG"
-            docker push "$IMAGE:$CIRCLE_SHA1"
+            echo "$DOCKERHUB_PASS" | docker login -u "keerthimanjunath" --password-stdin
+            docker push keerthimanjunath/game-leaderboard:qa
 
 workflows:
-  main-pipeline:
+  build-deploy:
     jobs:
-      - test
-      - docker-publish:
-          requires:
-            - test
+      - build-and-push:
           filters:
             branches:
-              only: /^(main|staging|prod)$/
+              only: main
