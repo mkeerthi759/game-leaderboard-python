@@ -1,5 +1,5 @@
 __pycache__/
-*.py[cod]
+*.pyc
 .venv/
 venv/
 .pytest_cache/
@@ -7,10 +7,8 @@ venv/
 .coverage
 coverage/
 coverage.xml
-htmlcov/
 test-results/
 gitleaks.json
 .env
-.env.*
-!.env.example
 .DS_Store
+secrets-scan.json
